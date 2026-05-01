@@ -1,0 +1,143 @@
+name: Build macOS App (Unsigned)
+
+# Produces an unsigned DMG ready to download and run.
+# On first launch macOS will show a Gatekeeper warning — right-click → Open to bypass it,
+# or run: xattr -d com.apple.quarantine /Applications/EXO.app
+#
+# Trigger options:
+#   1. Push a version tag:  git tag v0.1.0 && git push origin v0.1.0
+#   2. Manual run from the Actions tab (workflow_dispatch)
+#
+# For a signed + notarized release use build-app.yml (requires Apple Developer secrets).
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-macos-app:
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set release version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "RELEASE_VERSION=$VERSION" >> $GITHUB_ENV
+            if [[ "$VERSION" == *-* ]]; then
+              echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+            else
+              echo "IS_PRERELEASE=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "RELEASE_VERSION=0.0.0-dev.${GITHUB_SHA::7}" >> $GITHUB_ENV
+            echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python and sync dependencies
+        run: uv python install && uv sync --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Build dashboard
+        run: cd dashboard && npm ci && npm run build
+
+      - name: Cache macmon binary
+        id: cache-macmon
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/macmon
+          key: macmon-a1cd06b6cc0d5e61db24fd8832e74cd992097a7d
+
+      - name: Install macmon (pinned commit)
+        if: steps.cache-macmon.outputs.cache-hit != 'true'
+        run: |
+          cargo install --git https://github.com/vladkens/macmon \
+            --rev a1cd06b6cc0d5e61db24fd8832e74cd992097a7d \
+            macmon --force
+
+      - name: Build PyInstaller bundle
+        run: uv run pyinstaller packaging/pyinstaller/exo.spec
+
+      - name: Assemble EXO.app
+        run: |
+          APP=output/EXO.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          cp -R dist/exo "$APP/Contents/Resources/exo"
+
+          printf '#!/bin/bash\nexec "$(dirname "$0")/../Resources/exo/exo" "$@"\n' \
+            > "$APP/Contents/MacOS/EXO"
+          chmod +x "$APP/Contents/MacOS/EXO"
+
+          cat > "$APP/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key><string>EXO</string>
+              <key>CFBundleIdentifier</key><string>ai.exo.EXO</string>
+              <key>CFBundleName</key><string>EXO</string>
+              <key>CFBundleVersion</key><string>${RELEASE_VERSION}</string>
+              <key>CFBundleShortVersionString</key><string>${RELEASE_VERSION}</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>NSHighResolutionCapable</key><true/>
+              <key>LSUIElement</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Create DMG
+        run: |
+          mkdir -p output/dmg-root
+          cp -R output/EXO.app output/dmg-root/
+          ln -s /Applications output/dmg-root/Applications
+          hdiutil create \
+            -volname "EXO" \
+            -srcfolder output/dmg-root \
+            -ov -format UDZO \
+            "output/EXO-${RELEASE_VERSION}.dmg"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXO-dmg-${{ env.RELEASE_VERSION }}
+          path: output/EXO-${{ env.RELEASE_VERSION }}.dmg
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            gh release create "$GITHUB_REF_NAME" \
+              "output/EXO-${RELEASE_VERSION}.dmg" \
+              --title "EXO ${RELEASE_VERSION}" \
+              --generate-notes \
+              --prerelease
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "output/EXO-${RELEASE_VERSION}.dmg" \
+              --title "EXO ${RELEASE_VERSION}" \
+              --generate-notes
+          fi
